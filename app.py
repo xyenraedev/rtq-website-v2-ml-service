@@ -1,181 +1,150 @@
 """
-ML Service - Decision Tree Classifier untuk Santri
-Flask REST API
+Flask ML Service — endpoint REST untuk Decision Tree BBK/TBBK
+
+Endpoint:
+  GET  /health
+  POST /klasifikasi
+  POST /klasifikasi/batch
+  POST /latih
+  GET  /model/info
+  GET  /model/feature-importance
 """
 
-from flask import Flask, request, jsonify
+from __future__ import annotations
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import traceback
 
 from model import DecisionTreeModel
 
 app = Flask(__name__)
-CORS(app)  # Izinkan request dari Next.js
+CORS(app)
 
-# Inisialisasi model (singleton)
-model = DecisionTreeModel()
+# Singleton model — dimuat sekali saat server naik
+_model = DecisionTreeModel()
 
 
-# ─── Health Check ─────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
-@app.route('/health', methods=['GET'])
+
+@app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "model_trained": model.is_trained,
-        "model_versi": model.versi,
-        "total_data_latih": model.total_data_latih,
-    })
+    return jsonify(
+        {
+            "status": "ok",
+            "model_trained": _model.is_trained,
+            "model_versi": _model.versi,
+            "total_data_latih": _model.total_data_latih,
+        }
+    )
 
 
-# ─── Klasifikasi Satu Santri ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Klasifikasi tunggal
+# ---------------------------------------------------------------------------
 
-@app.route('/klasifikasi', methods=['POST'])
+
+@app.post("/klasifikasi")
 def klasifikasi():
-    """
-    Input JSON:
-    {
-        "jilid_saat_ini": 3,
-        "total_pengulangan_taskih": 1,
-        "durasi_jilid_0": 2,
-        "durasi_jilid_1": 3,
-        "durasi_jilid_2": null,
-        ...
-    }
-    """
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "Body JSON tidak boleh kosong"}), 400
+    body: dict = request.get_json(force=True) or {}
 
-        hasil = model.klasifikasi(data)
+    try:
+        hasil = _model.klasifikasi(body)
         return jsonify(hasil)
-
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Internal error: {exc}"}), 500
 
 
-# ─── Klasifikasi Batch (banyak santri sekaligus) ──────────────────────────────
+# ---------------------------------------------------------------------------
+# Klasifikasi batch
+# ---------------------------------------------------------------------------
 
-@app.route('/klasifikasi/batch', methods=['POST'])
+
+@app.post("/klasifikasi/batch")
 def klasifikasi_batch():
-    """
-    Input JSON:
-    {
-        "santri_list": [
-            {"id": "uuid1", "jilid_saat_ini": 3, ...},
-            {"id": "uuid2", "jilid_saat_ini": 5, ...}
-        ]
-    }
-    """
-    try:
-        data = request.get_json()
-        if not data or "santri_list" not in data:
-            return jsonify({"error": "Field 'santri_list' wajib ada"}), 400
+    body: dict = request.get_json(force=True) or {}
+    santri_list: list[dict] = body.get("santri_list", [])
 
-        santri_list = data["santri_list"]
-        if not isinstance(santri_list, list):
-            return jsonify({"error": "'santri_list' harus berupa array"}), 400
+    if not isinstance(santri_list, list):
+        return jsonify({"error": "santri_list harus berupa array"}), 400
 
-        hasil_list = []
-        berhasil = 0
-        gagal = 0
+    hasil: list[dict] = []
+    berhasil = 0
+    gagal = 0
 
-        for santri in santri_list:
-            santri_id = santri.get("id", "unknown")
-            try:
-                hasil = model.klasifikasi(santri)
-                hasil_list.append({
-                    "id": santri_id,
-                    "success": True,
-                    **hasil
-                })
-                berhasil += 1
-            except Exception as e:
-                hasil_list.append({
-                    "id": santri_id,
-                    "success": False,
-                    "error": str(e)
-                })
-                gagal += 1
+    for santri in santri_list:
+        santri_id = santri.get("id", "")
+        try:
+            res = _model.klasifikasi(santri)
+            hasil.append({"id": santri_id, "success": True, **res})
+            berhasil += 1
+        except Exception as exc:  # noqa: BLE001
+            hasil.append({"id": santri_id, "success": False, "error": str(exc)})
+            gagal += 1
 
-        return jsonify({
-            "hasil": hasil_list,
-            "berhasil": berhasil,
-            "gagal": gagal,
-        })
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+    return jsonify({"hasil": hasil, "berhasil": berhasil, "gagal": gagal})
 
 
-# ─── Latih Ulang Model ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Latih ulang model
+# ---------------------------------------------------------------------------
 
-@app.route('/latih', methods=['POST'])
+
+@app.post("/latih")
 def latih():
-    """
-    Input JSON:
-    {
-        "aturan": {
-            "batas_durasi_jilid_0_4": 3,
-            "batas_durasi_jilid_5_6": 4,
-            "batas_pengulangan_taskih": 2
-        },
-        "data_latih": [   <-- opsional, kalau tidak ada akan pakai synthetic data
-            {
-                "jilid_saat_ini": 3,
-                "total_pengulangan_taskih": 1,
-                "durasi_jilid_0": 2,
-                "label": "BBK"
-            },
-            ...
-        ]
-    }
-    """
+    body: dict = request.get_json(force=True) or {}
+    aturan: dict = body.get("aturan", {})
+    data_latih: list[dict] | None = body.get("data_latih")
+
+    if not aturan:
+        return jsonify({"error": "Field 'aturan' wajib diisi"}), 400
+
+    required_keys = [
+        "batas_durasi_jilid_0_4",
+        "batas_durasi_jilid_5_6",
+        "batas_pengulangan_taskih",
+    ]
+    for key in required_keys:
+        if key not in aturan:
+            return jsonify({"error": f"Field aturan.{key} wajib diisi"}), 400
+
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "Body JSON tidak boleh kosong"}), 400
-
-        aturan = data.get("aturan", {})
-        data_latih = data.get("data_latih", None)
-
-        hasil_evaluasi = model.latih(aturan=aturan, data_latih=data_latih)
-        return jsonify(hasil_evaluasi)
-
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+        hasil = _model.latih(aturan, data_latih=data_latih)
+        return jsonify(hasil)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"Gagal melatih model: {exc}"}), 500
 
 
-# ─── Info Model ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Model info
+# ---------------------------------------------------------------------------
 
-@app.route('/model/info', methods=['GET'])
+
+@app.get("/model/info")
 def model_info():
-    return jsonify(model.get_info())
+    return jsonify(_model.get_info())
 
 
-# ─── Feature Importance ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Feature importance
+# ---------------------------------------------------------------------------
 
-@app.route('/model/feature-importance', methods=['GET'])
+
+@app.get("/model/feature-importance")
 def feature_importance():
     try:
-        return jsonify(model.get_feature_importance())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify(_model.get_feature_importance())
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
-if __name__ == '__main__':
-    # Auto-latih dengan aturan default saat startup
-    print("🚀 Melatih model Decision Tree dengan data awal...")
-    model.latih(aturan={
-        "batas_durasi_jilid_0_4": 3,
-        "batas_durasi_jilid_5_6": 4,
-        "batas_pengulangan_taskih": 2,
-    })
-    print("✅ Model siap!")
-    app.run(host='0.0.0.0', port=5000, debug=True)  
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
