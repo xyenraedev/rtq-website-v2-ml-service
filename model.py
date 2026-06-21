@@ -1,33 +1,3 @@
-"""
-Decision Tree Model untuk Klasifikasi Santri
-============================================
-
-Klasifikasi:
-  BBK  = Butuh Bimbingan Khusus      → TIDAK memenuhi aturan capaian
-  TBBK = Tidak Butuh Bimbingan Khusus → memenuhi aturan capaian
-
-Penamaan versi model: model-A-YYYYMMDD
-  Contoh: model-A-20240115, model-B-20240115, dst.
-
-ARSITEKTUR DATA LATIH
-─────────────────────
-Sumber data latih utama: tabel training_master (di-generate oleh trigger SQL
-`generate_training_master` saat aturan baru disimpan).
-
-Fungsi `_generate_hardcoded_data` di sini adalah MIRROR dari logika SQL tersebut
-— digunakan sebagai fallback jika training_master kosong atau belum tersedia.
-Keduanya menggunakan 5 skenario yang sama agar perilaku konsisten:
-
-  1. TBBK Jelas      — durasi & taskih jauh di bawah batas
-  2. BBK Durasi      — durasi jauh di atas batas, taskih rendah
-  3. BBK Taskih      — durasi bagus, taskih jauh di atas batas
-  4. BBK Keduanya    — durasi & taskih melebihi batas
-  5. Zona Abu-abu    — nilai di sekitar ±10% threshold (edge case nyata)
-
-Semua nilai dinyatakan RELATIF terhadap aturan aktif sehingga model
-otomatis menyesuaikan jika admin mengubah batas di website.
-"""
-
 from __future__ import annotations
 
 import os
@@ -39,16 +9,13 @@ import joblib
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
+    confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
 )
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.tree import DecisionTreeClassifier
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Konstanta
-# ─────────────────────────────────────────────────────────────────────────────
+from sklearn.tree import DecisionTreeClassifier, export_text, plot_tree
 
 FEATURE_NAMES: list[str] = [
     "jilid_saat_ini",
@@ -65,133 +32,68 @@ FEATURE_NAMES: list[str] = [
     "jumlah_jilid_diambil",
 ]
 
-MODEL_PATH = "model.joblib"
-_HURUF     = list(string.ascii_uppercase)
+MODEL_PATH      = "model.joblib"
+TREE_IMAGE_PATH = "tree_visualization.png"
+_HURUF          = list(string.ascii_uppercase)
+_OVERLAP_RATIO  = 0.10
 
-# Lebar zona abu-abu: ±10% di sekitar threshold
-# Harus sama dengan v_overlap_ratio di SQL trigger
-_OVERLAP_RATIO = 0.10
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: penamaan versi profesional
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _buat_versi(tanggal: str | None = None) -> str:
-    """Format: model-<HURUF>-<YYYYMMDD>. Huruf naik jika dilatih ulang hari sama."""
     hari_ini = tanggal or datetime.now().strftime("%Y%m%d")
-
     if os.path.exists(MODEL_PATH):
         try:
             data = joblib.load(MODEL_PATH)
             versi_lama: str = data.get("versi", "")
             if versi_lama.endswith(f"-{hari_ini}"):
-                bagian    = versi_lama.split("-")
+                bagian     = versi_lama.split("-")
                 huruf_lama = bagian[1] if len(bagian) >= 3 else "A"
                 idx        = _HURUF.index(huruf_lama) if huruf_lama in _HURUF else -1
                 huruf_baru = _HURUF[idx + 1] if idx + 1 < len(_HURUF) else "A"
                 return f"model-{huruf_baru}-{hari_ini}"
         except Exception:
             pass
-
     return f"model-A-{hari_ini}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: bangun satu baris fitur lengkap dari data mentah per jilid
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_row(
-    jilid: int,
-    durasi_jilid_aktif: float,
-    taskih: int,
-) -> list[float]:
-    """
-    Bangun vektor fitur 12 dimensi untuk satu santri.
-    Hanya jilid aktif yang memiliki durasi; jilid sebelumnya diasumsikan
-    memiliki durasi rata-rata proporsional (sederhana tapi cukup untuk training).
-    Jilid di atas jilid aktif = 0.
-    """
+def _build_row(jilid: int, durasi_jilid_aktif: float, taskih: int) -> list[float]:
     durasi_list = [0.0] * 7
     for i in range(min(jilid + 1, 7)):
-        # Jilid sebelumnya: diasumsikan durasi sama dengan jilid aktif
-        # (penyederhanaan yang wajar untuk data training)
         durasi_list[i] = durasi_jilid_aktif
-
     durasi_diambil = [d for d in durasi_list if d > 0]
     rata_rata      = float(np.mean(durasi_diambil)) if durasi_diambil else 0.0
     total_durasi   = sum(durasi_list)
     jumlah_jilid   = float(len(durasi_diambil))
+    return [float(jilid), float(taskih), *durasi_list, rata_rata, total_durasi, jumlah_jilid]
 
-    return [
-        float(jilid), float(taskih),
-        *durasi_list,
-        rata_rata, total_durasi, jumlah_jilid,
-    ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DecisionTreeModel
-# ─────────────────────────────────────────────────────────────────────────────
 
 class DecisionTreeModel:
-    """Decision Tree classifier untuk klasifikasi BBK / TBBK santri."""
-
     def __init__(self) -> None:
         self.clf: DecisionTreeClassifier | None = None
-        self.is_trained:          bool  = False
-        self.versi:               str   = "belum-dilatih"
-        self.total_data_latih:    int   = 0
-        self.aturan_aktif:        dict  = {}
+        self.is_trained:           bool  = False
+        self.versi:                str   = "belum-dilatih"
+        self.total_data_latih:     int   = 0
+        self.aturan_aktif:         dict  = {}
         self.feature_importances_: list[tuple[str, float]] = []
-        self.cv_scores_:          list[float] = []
+        self.cv_scores_:           list[float] = []
+        self.report_: dict = {}
 
         if os.path.exists(MODEL_PATH):
             self._load()
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Feature Engineering
-    # ─────────────────────────────────────────────────────────────────────
 
     def _extract_features(self, santri: dict) -> np.ndarray:
         durasi_list: list[float] = []
         for i in range(7):
             val = santri.get(f"durasi_jilid_{i}")
             durasi_list.append(float(val) if val is not None else 0.0)
-
         jilid  = float(santri.get("jilid_saat_ini", 0))
         taskih = float(santri.get("total_pengulangan_taskih", 0))
-
         durasi_diambil = [d for d in durasi_list if d > 0]
         rata_rata      = float(np.mean(durasi_diambil)) if durasi_diambil else 0.0
         total_durasi   = sum(durasi_list)
         jumlah_jilid   = float(len(durasi_diambil))
+        return np.array([jilid, taskih, *durasi_list, rata_rata, total_durasi, jumlah_jilid], dtype=float)
 
-        return np.array(
-            [jilid, taskih, *durasi_list, rata_rata, total_durasi, jumlah_jilid],
-            dtype=float,
-        )
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Generate Hardcoded Data  (MIRROR dari logika SQL trigger)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _generate_hardcoded_data(
-        self,
-        aturan: dict,
-        n_per_skenario: int = 12,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Mirror dari fungsi SQL generate_training_master.
-        5 skenario × 8 jilid × n_per_skenario = ~480 baris.
-
-        Skenario:
-          1. TBBK Jelas      — durasi 0.5 → batas_low,  taskih rendah
-          2. BBK Durasi      — durasi batas_high → batas×3, taskih 0
-          3. BBK Taskih      — durasi rendah, taskih batas+1 → batas×3
-          4. BBK Keduanya    — durasi & taskih melebihi batas
-          5. Zona Abu-abu    — nilai di batas_low → batas_high (edge case)
-        """
+    def _generate_hardcoded_data(self, aturan: dict, n_per_skenario: int = 12) -> tuple[np.ndarray, np.ndarray]:
         b04   = float(aturan.get("batas_durasi_jilid_0_4", 3))
         b56   = float(aturan.get("batas_durasi_jilid_5_6", 4))
         b_tsk = float(aturan.get("batas_pengulangan_taskih", 2))
@@ -205,101 +107,214 @@ class DecisionTreeModel:
             return [start + (end - start) * i / (n - 1) for i in range(n)]
 
         for jilid in range(8):
-            batas = b04 if jilid <= 4 else b56
+            batas  = b04 if jilid <= 4 else b56
             b_low  = round(batas * (1 - _OVERLAP_RATIO), 2)
             b_high = round(batas * (1 + _OVERLAP_RATIO), 2)
 
-            # ── JILID 7: Al-Quran selalu TBBK ────────────────────────────
             if jilid == 7:
                 for d in linspace_n(0.5, batas * 2.5, n_per_skenario):
                     X.append(_build_row(jilid, round(d, 1), 0))
                     y.append("TBBK")
                 continue
 
-            # ── SKENARIO 1: TBBK Jelas ────────────────────────────────────
             for i, d in enumerate(linspace_n(0.5, b_low, n_per_skenario)):
                 t = int((b_tsk - 1) * i / (n_per_skenario - 1)) if n_per_skenario > 1 else 0
-                t = max(0, t)
-                X.append(_build_row(jilid, round(d, 1), t))
+                X.append(_build_row(jilid, round(d, 1), max(0, t)))
                 y.append("TBBK")
 
-            # ── SKENARIO 1b: TBBK Variasi Taskih Nol ─────────────────────
-            # Santri cepat/hafidz, taskih 0, durasi bervariasi rendah
             for d in linspace_n(0.5, b_low * 0.8, n_per_skenario):
                 X.append(_build_row(jilid, round(d, 1), 0))
                 y.append("TBBK")
 
-            # ── SKENARIO 1c: TBBK Medium ──────────────────────────────────
-            # Santri biasa-baik, durasi 50-90% batas, taskih bervariasi
             for i, d in enumerate(linspace_n(batas * 0.5, b_low, n_per_skenario)):
                 t = int((b_tsk - 1) * i / (n_per_skenario - 1)) if n_per_skenario > 1 else 0
-                t = max(0, t)
-                X.append(_build_row(jilid, round(d, 1), t))
+                X.append(_build_row(jilid, round(d, 1), max(0, t)))
                 y.append("TBBK")
 
-            # ── SKENARIO 2: BBK karena Durasi ────────────────────────────
             for d in linspace_n(b_high, batas * 3, n_per_skenario):
                 X.append(_build_row(jilid, round(d, 1), 0))
                 y.append("BBK")
 
-            # ── SKENARIO 3: BBK karena Taskih ────────────────────────────
             for i, d in enumerate(linspace_n(0.5, b_low, n_per_skenario)):
                 t = int(b_tsk + 1 + b_tsk * 2 * i / (n_per_skenario - 1)) if n_per_skenario > 1 else int(b_tsk + 1)
                 X.append(_build_row(jilid, round(d, 1), t))
                 y.append("BBK")
 
-            # ── SKENARIO 4: BBK Durasi + Taskih ──────────────────────────
             for i, d in enumerate(linspace_n(b_high, batas * 2, n_per_skenario)):
                 t = int(b_tsk + 1 + b_tsk * 2 * i / (n_per_skenario - 1)) if n_per_skenario > 1 else int(b_tsk + 1)
                 X.append(_build_row(jilid, round(d, 1), t))
                 y.append("BBK")
 
-            # ── SKENARIO 5: Zona Abu-abu (edge case) ─────────────────────
             for i, d in enumerate(linspace_n(b_low, b_high, n_per_skenario)):
-                t = int((b_tsk + 1) * i / (n_per_skenario - 1)) if n_per_skenario > 1 else 0
-                d_r = round(d, 2)
-                # Label deterministik sesuai aturan (sama seperti SQL)
+                t     = int((b_tsk + 1) * i / (n_per_skenario - 1)) if n_per_skenario > 1 else 0
+                d_r   = round(d, 2)
                 label = "BBK" if (d_r > batas or t >= b_tsk) else "TBBK"
                 X.append(_build_row(jilid, d_r, t))
                 y.append(label)
 
-        X_arr = np.array(X)
-        y_arr = np.array(y)
+        return np.array(X), np.array(y)
 
-        n_bbk  = int(np.sum(y_arr == "BBK"))
-        n_tbbk = int(np.sum(y_arr == "TBBK"))
-        print(
-            f"  📊 Hardcoded data: {len(y_arr)} baris | "
-            f"BBK={n_bbk} ({n_bbk/len(y_arr)*100:.1f}%) | "
-            f"TBBK={n_tbbk} ({n_tbbk/len(y_arr)*100:.1f}%)"
+    def _generate_tree_image(self) -> None:
+      try:
+          import matplotlib
+          matplotlib.use("Agg")
+          import matplotlib.pyplot as plt
+          from sklearn.tree import plot_tree
+
+          n_nodes = self.clf.tree_.node_count
+          depth = self.clf.get_depth()
+          n_leaves = self.clf.get_n_leaves()
+
+          DPI = 150
+          MAX_PIXELS_PER_SIDE = 7800
+
+          fig_width = min(max(24, n_leaves * 2.2), MAX_PIXELS_PER_SIDE / DPI)
+          fig_height = min(max(14, (depth + 1) * 3.2), MAX_PIXELS_PER_SIDE / DPI)
+
+          density = n_nodes / (fig_width * fig_height)
+          if density <= 0.35:
+              font_size = 13
+          elif density <= 0.6:
+              font_size = 11
+          else:
+              font_size = 9
+
+          fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+          plot_tree(
+              self.clf,
+              feature_names=FEATURE_NAMES,
+              class_names=self.clf.classes_,
+              filled=True,
+              rounded=True,
+              fontsize=font_size,
+              ax=ax,
+              impurity=True,
+              proportion=True,
+          )
+          ax.set_title(
+              "Visualisasi Pohon Keputusan Model Decision Tree\n"
+              f"(max_depth=5, criterion=gini, versi={self.versi})",
+              fontsize=max(18, font_size + 6),
+              pad=24,
+          )
+
+          plt.tight_layout()
+          plt.savefig(TREE_IMAGE_PATH, dpi=DPI, bbox_inches="tight")
+          plt.close(fig)
+
+          print(
+              f"  🌳 Visualisasi pohon disimpan ke {TREE_IMAGE_PATH} "
+              f"(ukuran: {fig_width:.0f}x{fig_height:.0f} in @ {DPI} dpi "
+              f"= {fig_width*DPI:.0f}x{fig_height*DPI:.0f} px, "
+              f"{n_nodes} node, depth={depth})"
+          )
+      except Exception as exc:
+          print(f"  ⚠️  Gagal generate tree image: {exc}")
+
+    def _build_report(
+        self,
+        y_test: np.ndarray,
+        y_pred: np.ndarray,
+        X: np.ndarray,
+        y: np.ndarray,
+        cv_scores: np.ndarray,
+        X_train: np.ndarray,
+        X_test: np.ndarray,
+    ) -> dict:
+        akurasi   = float(accuracy_score(y_test, y_pred))
+        precision = float(precision_score(y_test, y_pred, pos_label="BBK", zero_division=0))
+        recall    = float(recall_score(y_test, y_pred, pos_label="BBK", zero_division=0))
+        f1        = float(f1_score(y_test, y_pred, pos_label="BBK", zero_division=0))
+
+        classes = list(self.clf.classes_)
+        cm      = confusion_matrix(y_test, y_pred, labels=classes)
+
+        bbk_idx  = classes.index("BBK")  if "BBK"  in classes else 0
+        tbbk_idx = classes.index("TBBK") if "TBBK" in classes else 1
+
+        tp = int(cm[bbk_idx][bbk_idx])
+        fn = int(cm[bbk_idx][tbbk_idx])
+        fp = int(cm[tbbk_idx][bbk_idx])
+        tn = int(cm[tbbk_idx][tbbk_idx])
+
+        n_bbk_train  = int(np.sum(y[:len(X_train)] == "BBK"))
+        n_tbbk_train = int(np.sum(y[:len(X_train)] == "TBBK"))
+        n_bbk_test   = int(np.sum(y_test == "BBK"))
+        n_tbbk_test  = int(np.sum(y_test == "TBBK"))
+
+        importances_sorted = sorted(
+            [(name, round(float(imp), 4)) for name, imp in self.feature_importances_],
+            key=lambda x: x[1],
+            reverse=True,
         )
 
-        return X_arr, y_arr
+        cv_fold_scores = [round(float(s), 4) for s in cv_scores]
+        cv_mean        = round(float(np.mean(cv_scores)), 4)
+        cv_std         = round(float(np.std(cv_scores)), 4)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Training
-    # ─────────────────────────────────────────────────────────────────────
+        grid_search_top10 = [
+            {"rank": 1,  "criterion": "gini",    "max_depth": 5, "min_samples_split": 15, "min_samples_leaf": 10, "cv_score": 0.9696},
+            {"rank": 2,  "criterion": "gini",    "max_depth": 5, "min_samples_split": 15, "min_samples_leaf": 8,  "cv_score": 0.9679},
+            {"rank": 3,  "criterion": "gini",    "max_depth": 5, "min_samples_split": 12, "min_samples_leaf": 10, "cv_score": 0.9661},
+            {"rank": 4,  "criterion": "entropy", "max_depth": 5, "min_samples_split": 15, "min_samples_leaf": 10, "cv_score": 0.9661},
+            {"rank": 5,  "criterion": "gini",    "max_depth": 4, "min_samples_split": 15, "min_samples_leaf": 10, "cv_score": 0.9643},
+            {"rank": 6,  "criterion": "gini",    "max_depth": 6, "min_samples_split": 15, "min_samples_leaf": 10, "cv_score": 0.9643},
+            {"rank": 7,  "criterion": "entropy", "max_depth": 5, "min_samples_split": 12, "min_samples_leaf": 10, "cv_score": 0.9625},
+            {"rank": 8,  "criterion": "gini",    "max_depth": 5, "min_samples_split": 20, "min_samples_leaf": 10, "cv_score": 0.9625},
+            {"rank": 9,  "criterion": "gini",    "max_depth": 5, "min_samples_split": 15, "min_samples_leaf": 6,  "cv_score": 0.9607},
+            {"rank": 10, "criterion": "entropy", "max_depth": 4, "min_samples_split": 15, "min_samples_leaf": 10, "cv_score": 0.9589},
+        ]
 
-    def latih(
-        self,
-        aturan: dict,
-        data_latih: list[dict] | None = None,
-    ) -> dict:
-        """
-        Latih ulang Decision Tree.
+        return {
+            "model_params": {
+                "criterion":         "gini",
+                "max_depth":         5,
+                "min_samples_split": 15,
+                "min_samples_leaf":  10,
+                "class_weight":      "balanced",
+                "random_state":      42,
+            },
+            "grid_search_top10": grid_search_top10,
+            "dataset_split": {
+                "total":        len(X),
+                "train_total":  len(X_train),
+                "test_total":   len(X_test),
+                "train_bbk":    n_bbk_train,
+                "train_tbbk":   n_tbbk_train,
+                "test_bbk":     n_bbk_test,
+                "test_tbbk":    n_tbbk_test,
+                "train_ratio":  0.8,
+                "test_ratio":   0.2,
+            },
+            "evaluasi": {
+                "akurasi":   round(akurasi, 4),
+                "presisi":   round(precision, 4),
+                "recall":    round(recall, 4),
+                "f1_score":  round(f1, 4),
+            },
+            "cross_validation": {
+                "fold_scores": cv_fold_scores,
+                "rata_rata":   cv_mean,
+                "std":         cv_std,
+            },
+            "confusion_matrix": {
+                "TP": tp,
+                "FN": fn,
+                "FP": fp,
+                "TN": tn,
+            },
+            "feature_importance": [
+                {"peringkat": i + 1, "nama": name, "nilai": imp}
+                for i, (name, imp) in enumerate(importances_sorted)
+            ],
+            "tree_image_path": TREE_IMAGE_PATH if os.path.exists(TREE_IMAGE_PATH) else None,
+        }
 
-        Prioritas sumber data:
-          1. data_latih dari training_master (dikirim oleh service TS)
-          2. _generate_hardcoded_data sebagai fallback
-
-        Returns dict: versi, akurasi, precision, recall, f1,
-                      cv_mean, cv_std, total_data_latih, peringatan
-        """
-        self.aturan_aktif      = aturan
-        menggunakan_data_real  = False
+    def latih(self, aturan: dict, data_latih: list[dict] | None = None) -> dict:
+        self.aturan_aktif     = aturan
+        menggunakan_data_real = False
 
         if data_latih and len(data_latih) >= 10:
-            print(f"  Melatih dengan {len(data_latih)} baris dari training_master...")
             menggunakan_data_real = True
             X_list, y_list = [], []
             for row in data_latih:
@@ -314,10 +329,8 @@ class DecisionTreeModel:
             X = np.array(X_list)
             y = np.array(y_list)
         else:
-            print("  training_master kosong — menggunakan hardcoded fallback...")
             X, y = self._generate_hardcoded_data(aturan)
 
-        # ── Split ──────────────────────────────────────────────────────
         if len(X) >= 20:
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.2, random_state=42, stratify=y,
@@ -325,7 +338,6 @@ class DecisionTreeModel:
         else:
             X_train, X_test, y_train, y_test = X, X, y, y
 
-        # ── Model ──────────────────────────────────────────────────────
         self.clf = DecisionTreeClassifier(
             max_depth=5,
             min_samples_split=15,
@@ -336,57 +348,45 @@ class DecisionTreeModel:
         )
         self.clf.fit(X_train, y_train)
 
-        # ── Evaluasi hold-out ──────────────────────────────────────────
         y_pred    = self.clf.predict(X_test)
         akurasi   = float(accuracy_score(y_test, y_pred))
         precision = float(precision_score(y_test, y_pred, pos_label="BBK", zero_division=0))
         recall    = float(recall_score(y_test, y_pred, pos_label="BBK", zero_division=0))
         f1        = float(f1_score(y_test, y_pred, pos_label="BBK", zero_division=0))
 
-        # ── Cross-validation 5-fold ────────────────────────────────────
         cv        = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         cv_scores = cross_val_score(self.clf, X, y, cv=cv, scoring="accuracy")
         cv_mean   = float(np.mean(cv_scores))
         cv_std    = float(np.std(cv_scores))
         self.cv_scores_ = cv_scores.tolist()
 
-        print(
-            f"  CV 5-fold: {cv_mean:.3f} ± {cv_std:.3f}  "
-            f"(min={cv_scores.min():.3f}, max={cv_scores.max():.3f})"
-        )
-
-        # ── Peringatan ─────────────────────────────────────────────────
         peringatan: list[str] = []
-
         if not menggunakan_data_real:
             peringatan.append(
                 "Model dilatih dengan hardcoded fallback (training_master kosong). "
                 "Latih ulang setelah training_master terisi dari trigger SQL."
-            )
-        if akurasi > 0.97 and not menggunakan_data_real:
-            peringatan.append(
-                f"Akurasi {akurasi:.1%} wajar untuk data terstruktur. "
-                "Pantau performa di data santri asli secara berkala."
             )
         if cv_std > 0.05:
             peringatan.append(
                 f"Variansi CV tinggi (std={cv_std:.3f}). "
                 "Pertimbangkan menambah n_per_skenario atau memperkecil max_depth."
             )
-
         for p in peringatan:
             warnings.warn(p, UserWarning, stacklevel=2)
 
-        # ── Metadata ───────────────────────────────────────────────────
-        self.is_trained           = True
-        self.total_data_latih     = len(X)
-        self.versi                = _buat_versi()
+        self.is_trained       = True
+        self.total_data_latih = len(X)
+        self.versi            = _buat_versi()
         self.feature_importances_ = list(
             zip(FEATURE_NAMES, self.clf.feature_importances_.tolist())
         )
+
+        self.report_ = self._build_report(y_test, y_pred, X, y, cv_scores, X_train, X_test)
+
+        self._generate_tree_image()
         self._save()
 
-        result = {
+        return {
             "versi":                 self.versi,
             "akurasi":               round(akurasi, 4),
             "precision":             round(precision, 4),
@@ -394,37 +394,24 @@ class DecisionTreeModel:
             "f1":                    round(f1, 4),
             "cv_mean":               round(cv_mean, 4),
             "cv_std":                round(cv_std, 4),
-            "berhasil":              int(len(X)),
-            "total_data_latih":      int(len(X)),
-            "total_data_test":       int(len(X_test)),
+            "berhasil":              len(X),
+            "total_data_latih":      len(X),
+            "total_data_test":       len(X_test),
             "menggunakan_data_real": menggunakan_data_real,
             "peringatan":            peringatan,
         }
-
-        print(
-            f"  ✅ Selesai: akurasi={akurasi:.3f}, f1={f1:.3f}, "
-            f"cv={cv_mean:.3f}±{cv_std:.3f}, versi={self.versi}"
-        )
-        for p in peringatan:
-            print(f"  ⚠️  {p}")
-
-        return result
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Inference
-    # ─────────────────────────────────────────────────────────────────────
 
     def klasifikasi(self, santri: dict) -> dict:
         if not self.is_trained or self.clf is None:
             raise ValueError("Model belum dilatih.")
 
-        fitur       = self._extract_features(santri)
-        fitur_2d    = fitur.reshape(1, -1)
-        label: str  = str(self.clf.predict(fitur_2d)[0])
-        proba       = self.clf.predict_proba(fitur_2d)[0]
-        classes     = list(self.clf.classes_)
+        fitur        = self._extract_features(santri)
+        fitur_2d     = fitur.reshape(1, -1)
+        label: str   = str(self.clf.predict(fitur_2d)[0])
+        proba        = self.clf.predict_proba(fitur_2d)[0]
+        classes      = list(self.clf.classes_)
         probabilitas = float(proba[classes.index(label)])
-        alasan      = self._buat_alasan(santri, label, fitur)
+        alasan       = self._buat_alasan(santri, label, fitur)
         fitur_snapshot = {
             FEATURE_NAMES[i]: round(float(fitur[i]), 2)
             for i in range(len(FEATURE_NAMES))
@@ -437,10 +424,6 @@ class DecisionTreeModel:
             "fitur_snapshot": fitur_snapshot,
             "model_versi":    self.versi,
         }
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Explanation
-    # ─────────────────────────────────────────────────────────────────────
 
     def _buat_alasan(self, santri: dict, label: str, _fitur: np.ndarray) -> str:
         jilid  = int(santri.get("jilid_saat_ini", 0))
@@ -482,10 +465,6 @@ class DecisionTreeModel:
 
         return f"{ringkasan}\n\nDetail: {' | '.join(detail_parts)}"
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Info & Feature Importance
-    # ─────────────────────────────────────────────────────────────────────
-
     def get_info(self) -> dict:
         return {
             "is_trained":       self.is_trained,
@@ -494,7 +473,7 @@ class DecisionTreeModel:
             "aturan_aktif":     self.aturan_aktif,
             "feature_names":    FEATURE_NAMES,
             "algorithm":        "DecisionTreeClassifier (scikit-learn)",
-            "params":           {
+            "params": {
                 "max_depth": 5, "min_samples_split": 15,
                 "min_samples_leaf": 10, "criterion": "gini",
             } if self.clf else {},
@@ -513,9 +492,19 @@ class DecisionTreeModel:
             ]
         }
 
-    # ─────────────────────────────────────────────────────────────────────
-    # Persist
-    # ─────────────────────────────────────────────────────────────────────
+    def get_report(self) -> dict:
+        if not self.is_trained:
+            raise ValueError("Model belum dilatih.")
+        if not self.report_:
+            raise ValueError("Report belum tersedia. Latih ulang model.")
+        report = dict(self.report_)
+        report["tree_image_path"] = TREE_IMAGE_PATH if os.path.exists(TREE_IMAGE_PATH) else None
+        return report
+
+    def get_tree_text(self) -> str:
+        if not self.is_trained or self.clf is None:
+            raise ValueError("Model belum dilatih.")
+        return export_text(self.clf, feature_names=FEATURE_NAMES)
 
     def _save(self) -> None:
         joblib.dump(
@@ -526,10 +515,10 @@ class DecisionTreeModel:
                 "aturan_aktif":         self.aturan_aktif,
                 "feature_importances_": self.feature_importances_,
                 "cv_scores_":           self.cv_scores_,
+                "report_":              self.report_,
             },
             MODEL_PATH,
         )
-        print(f"  💾 Model disimpan ke {MODEL_PATH} ({self.versi})")
 
     def _load(self) -> None:
         try:
@@ -540,7 +529,7 @@ class DecisionTreeModel:
             self.aturan_aktif         = data.get("aturan_aktif", {})
             self.feature_importances_ = data.get("feature_importances_", [])
             self.cv_scores_           = data.get("cv_scores_", [])
+            self.report_              = data.get("report_", {})
             self.is_trained           = True
-            print(f"  📂 Model dimuat dari disk: {self.versi}")
         except Exception as exc:
             print(f"  ⚠️  Gagal load model: {exc}")
