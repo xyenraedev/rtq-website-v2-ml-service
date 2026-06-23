@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import string
 import warnings
 from datetime import datetime
 
@@ -34,25 +33,18 @@ FEATURE_NAMES: list[str] = [
 
 MODEL_PATH      = "model.joblib"
 TREE_IMAGE_PATH = "tree_visualization.png"
-_HURUF          = list(string.ascii_uppercase)
 _OVERLAP_RATIO  = 0.10
 
 
-def _buat_versi(tanggal: str | None = None) -> str:
-    hari_ini = tanggal or datetime.now().strftime("%Y%m%d")
-    if os.path.exists(MODEL_PATH):
-        try:
-            data = joblib.load(MODEL_PATH)
-            versi_lama: str = data.get("versi", "")
-            if versi_lama.endswith(f"-{hari_ini}"):
-                bagian     = versi_lama.split("-")
-                huruf_lama = bagian[1] if len(bagian) >= 3 else "A"
-                idx        = _HURUF.index(huruf_lama) if huruf_lama in _HURUF else -1
-                huruf_baru = _HURUF[idx + 1] if idx + 1 < len(_HURUF) else "A"
-                return f"model-{huruf_baru}-{hari_ini}"
-        except Exception:
-            pass
-    return f"model-A-{hari_ini}"
+def _buat_versi(aturan: dict) -> str:
+    """Format versi: decision-tree_<b04><b56><b_tsk>, mis. decision-tree_343
+    untuk batas_durasi_jilid_0_4=3, batas_durasi_jilid_5_6=4,
+    batas_pengulangan_taskih=3. Versi lama akan otomatis ter-replace
+    kalau aturan sama dilatih ulang — tidak ada pembedaan huruf/tanggal."""
+    b04   = int(aturan.get("batas_durasi_jilid_0_4", 3))
+    b56   = int(aturan.get("batas_durasi_jilid_5_6", 4))
+    b_tsk = int(aturan.get("batas_pengulangan_taskih", 2))
+    return f"decision-tree_{b04}{b56}{b_tsk}"
 
 
 def _build_row(jilid: int, durasi_jilid_aktif: float, taskih: int) -> list[float]:
@@ -376,7 +368,7 @@ class DecisionTreeModel:
 
         self.is_trained       = True
         self.total_data_latih = len(X)
-        self.versi            = _buat_versi()
+        self.versi            = _buat_versi(aturan)
         self.feature_importances_ = list(
             zip(FEATURE_NAMES, self.clf.feature_importances_.tolist())
         )
@@ -401,31 +393,82 @@ class DecisionTreeModel:
             "peringatan":            peringatan,
         }
 
-    def klasifikasi(self, santri: dict) -> dict:
+    def klasifikasi(self, santri: dict, aturan: dict | None = None) -> dict:
         if not self.is_trained or self.clf is None:
             raise ValueError("Model belum dilatih.")
 
+        # PENTING: aturan yang dipakai untuk keputusan akhir HARUS aturan
+        # yang sedang is_active=true di database SAAT INI (dikirim oleh
+        # caller setiap request), bukan otomatis "aturan_aktif" yang
+        # dibakar ke model.joblib waktu training terakhir. Kalau admin
+        # mengganti aturan tapi belum retrain, dua hal ini bisa berbeda —
+        # itu yang menyebabkan hasil evaluasi tidak sesuai aturan aktif.
+        aturan_efektif = aturan if aturan else self.aturan_aktif
+        aturan_stale   = bool(aturan) and aturan != self.aturan_aktif
+
         fitur        = self._extract_features(santri)
         fitur_2d     = fitur.reshape(1, -1)
-        label: str   = str(self.clf.predict(fitur_2d)[0])
+        label_ml: str = str(self.clf.predict(fitur_2d)[0])
         proba        = self.clf.predict_proba(fitur_2d)[0]
         classes      = list(self.clf.classes_)
-        probabilitas = float(proba[classes.index(label)])
-        alasan       = self._buat_alasan(santri, label, fitur)
+        probabilitas = float(proba[classes.index(label_ml)])
+
+        label_rule       = self._evaluasi_rule(santri, aturan_efektif)
+        override_terjadi = label_rule != label_ml
+        label_final      = label_rule  # aturan aktif = final authority, bukan ML
+
+        alasan = self._buat_alasan(santri, label_final, aturan_efektif)
+        if override_terjadi:
+            alasan += (
+                f"\n\n⚠️ Model ML (versi {self.versi}) memprediksi '{label_ml}' "
+                f"(probabilitas {probabilitas:.2%}), namun ditimpa oleh rule-based "
+                "safety layer berdasarkan aturan capaian yang sedang aktif."
+            )
+        if aturan_stale:
+            alasan += (
+                "\n\n⚠️ Model belum dilatih ulang dengan aturan capaian yang sedang "
+                "aktif (model masih memakai aturan hasil training terakhir). "
+                "Akurasi prediksi ML mungkin menurun — segera latih ulang model. "
+                "Keputusan akhir (status) tetap dijamin sesuai aturan aktif."
+            )
+
         fitur_snapshot = {
             FEATURE_NAMES[i]: round(float(fitur[i]), 2)
             for i in range(len(FEATURE_NAMES))
         }
 
         return {
-            "status":         label,
+            "status":         label_final,
+            "status_ml":      label_ml,
             "probabilitas":   round(probabilitas, 4),
+            "override_rule":  override_terjadi,
+            "model_stale":    aturan_stale,
             "alasan":         alasan,
             "fitur_snapshot": fitur_snapshot,
             "model_versi":    self.versi,
         }
 
-    def _buat_alasan(self, santri: dict, label: str, _fitur: np.ndarray) -> str:
+    def _evaluasi_rule(self, santri: dict, aturan: dict) -> str:
+        """Hard-rule sebagai final authority — formula identik dengan
+        generator data training, tapi memakai aturan yang dikirim caller
+        (aturan aktif saat ini), bukan aturan yang dibakar ke model."""
+        b04   = float(aturan.get("batas_durasi_jilid_0_4", 3))
+        b56   = float(aturan.get("batas_durasi_jilid_5_6", 4))
+        b_tsk = float(aturan.get("batas_pengulangan_taskih", 2))
+        jilid  = int(santri.get("jilid_saat_ini", 0))
+        taskih = float(santri.get("total_pengulangan_taskih", 0))
+
+        if jilid >= 7:
+            return "TBBK"  # level Al-Quran tidak dievaluasi BBK/TBBK
+
+        batas            = b04 if jilid <= 4 else b56
+        durasi_jilid_ini = float(santri.get(f"durasi_jilid_{jilid}", 0) or 0)
+
+        if durasi_jilid_ini > batas or taskih >= b_tsk:
+            return "BBK"
+        return "TBBK"
+
+    def _buat_alasan(self, santri: dict, label: str, aturan: dict) -> str:
         jilid  = int(santri.get("jilid_saat_ini", 0))
         taskih = int(santri.get("total_pengulangan_taskih", 0))
 
@@ -438,9 +481,9 @@ class DecisionTreeModel:
         rata_rata   = round(float(np.mean(durasi_diambil)), 1) if durasi_diambil else 0
         jilid_label = "Al-Quran" if jilid == 7 else f"Jilid {jilid}"
 
-        b04   = float(self.aturan_aktif.get("batas_durasi_jilid_0_4", 3))
-        b56   = float(self.aturan_aktif.get("batas_durasi_jilid_5_6", 4))
-        b_tsk = float(self.aturan_aktif.get("batas_pengulangan_taskih", 2))
+        b04   = float(aturan.get("batas_durasi_jilid_0_4", 3))
+        b56   = float(aturan.get("batas_durasi_jilid_5_6", 4))
+        b_tsk = float(aturan.get("batas_pengulangan_taskih", 2))
 
         detail_parts: list[str] = []
         for i in range(7):

@@ -26,8 +26,16 @@ def health():
 @app.post("/klasifikasi")
 def klasifikasi():
     body: dict = request.get_json(force=True) or {}
+
+    # 'aturan' adalah aturan_capaian yang sedang is_active=true di DB,
+    # WAJIB dikirim oleh caller (lihat mlClient.ts mlKlasifikasi).
+    # Tanpa ini, endpoint tidak punya cara tahu aturan mana yang aktif
+    # SEKARANG — dan akan diam-diam memakai aturan hasil training
+    # terakhir, yang bisa berbeda dari aturan aktif di DB.
+    aturan: dict | None = body.pop("aturan", None)
+
     try:
-        return jsonify(_model.klasifikasi(body))
+        return jsonify(_model.klasifikasi(body, aturan=aturan))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -38,6 +46,7 @@ def klasifikasi():
 def klasifikasi_batch():
     body: dict        = request.get_json(force=True) or {}
     santri_list: list = body.get("santri_list", [])
+    aturan: dict | None = body.get("aturan")  # aturan aktif, sama untuk semua santri dalam batch
 
     if not isinstance(santri_list, list):
         return jsonify({"error": "santri_list harus berupa array"}), 400
@@ -49,7 +58,7 @@ def klasifikasi_batch():
     for santri in santri_list:
         santri_id = santri.get("id", "")
         try:
-            res = _model.klasifikasi(santri)
+            res = _model.klasifikasi(santri, aturan=aturan)
             hasil.append({"id": santri_id, "success": True, **res})
             berhasil += 1
         except Exception as exc:
