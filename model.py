@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import warnings
 from datetime import datetime
+from io import BytesIO
 
 import joblib
 import numpy as np
@@ -31,9 +32,12 @@ FEATURE_NAMES: list[str] = [
     "jumlah_jilid_diambil",
 ]
 
-MODEL_PATH      = "model.joblib"
-TREE_IMAGE_PATH = "tree_visualization.png"
-_OVERLAP_RATIO  = 0.10
+MODEL_PATH     = "model.joblib"
+# Catatan: gambar pohon keputusan TIDAK lagi disimpan ke disk.
+# Gambar dibuat on-demand di memori (BytesIO) setiap kali endpoint
+# /model/tree-image dipanggil — cocok untuk lingkungan serverless
+# (mis. Vercel) yang filesystem-nya read-only / tidak persisten.
+_OVERLAP_RATIO = 0.10
 
 
 def _buat_versi(aturan: dict) -> str:
@@ -146,62 +150,76 @@ class DecisionTreeModel:
 
         return np.array(X), np.array(y)
 
-    def _generate_tree_image(self) -> None:
-      try:
-          import matplotlib
-          matplotlib.use("Agg")
-          import matplotlib.pyplot as plt
-          from sklearn.tree import plot_tree
+    def _generate_tree_image(self) -> BytesIO | None:
+        """Membuat visualisasi pohon keputusan sepenuhnya di memori
+        (tidak pernah ditulis ke disk). Dipanggil on-demand oleh
+        endpoint /model/tree-image, bukan saat training.
+        Return: BytesIO berisi PNG, atau None kalau gagal / belum dilatih.
+        """
+        if self.clf is None:
+            print("  ⚠️  Gagal generate tree image: model belum dilatih")
+            return None
 
-          n_nodes = self.clf.tree_.node_count
-          depth = self.clf.get_depth()
-          n_leaves = self.clf.get_n_leaves()
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from sklearn.tree import plot_tree
 
-          DPI = 150
-          MAX_PIXELS_PER_SIDE = 7800
+            n_nodes = self.clf.tree_.node_count
+            depth = self.clf.get_depth()
+            n_leaves = self.clf.get_n_leaves()
 
-          fig_width = min(max(24, n_leaves * 2.2), MAX_PIXELS_PER_SIDE / DPI)
-          fig_height = min(max(14, (depth + 1) * 3.2), MAX_PIXELS_PER_SIDE / DPI)
+            DPI = 150
+            MAX_PIXELS_PER_SIDE = 7800
 
-          density = n_nodes / (fig_width * fig_height)
-          if density <= 0.35:
-              font_size = 13
-          elif density <= 0.6:
-              font_size = 11
-          else:
-              font_size = 9
+            fig_width = min(max(24, n_leaves * 2.2), MAX_PIXELS_PER_SIDE / DPI)
+            fig_height = min(max(14, (depth + 1) * 3.2), MAX_PIXELS_PER_SIDE / DPI)
 
-          fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-          plot_tree(
-              self.clf,
-              feature_names=FEATURE_NAMES,
-              class_names=self.clf.classes_,
-              filled=True,
-              rounded=True,
-              fontsize=font_size,
-              ax=ax,
-              impurity=True,
-              proportion=True,
-          )
-          ax.set_title(
-              "Visualisasi Pohon Keputusan Model Decision Tree\n"
-              f"(max_depth=5, criterion=gini, versi={self.versi})",
-              fontsize=max(18, font_size + 6),
-              pad=24,
-          )
+            density = n_nodes / (fig_width * fig_height)
+            if density <= 0.35:
+                font_size = 13
+            elif density <= 0.6:
+                font_size = 11
+            else:
+                font_size = 9
 
-          plt.tight_layout()
-          plt.savefig(TREE_IMAGE_PATH, dpi=DPI, bbox_inches="tight")
-          plt.close(fig)
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            plot_tree(
+                self.clf,
+                feature_names=FEATURE_NAMES,
+                class_names=self.clf.classes_,
+                filled=True,
+                rounded=True,
+                fontsize=font_size,
+                ax=ax,
+                impurity=True,
+                proportion=True,
+            )
+            ax.set_title(
+                "Visualisasi Pohon Keputusan Model Decision Tree\n"
+                f"(max_depth=5, criterion=gini, versi={self.versi})",
+                fontsize=max(18, font_size + 6),
+                pad=24,
+            )
 
-          print(
-              f"  🌳 Visualisasi pohon disimpan ke {TREE_IMAGE_PATH} "
-              f"(ukuran: {fig_width:.0f}x{fig_height:.0f} in @ {DPI} dpi "
-              f"= {fig_width*DPI:.0f}x{fig_height*DPI:.0f} px, "
-              f"{n_nodes} node, depth={depth})"
-          )
-      except Exception as exc:
-          print(f"  ⚠️  Gagal generate tree image: {exc}")
+            plt.tight_layout()
+
+            buffer = BytesIO()
+            plt.savefig(buffer, format="png", dpi=DPI, bbox_inches="tight")
+            plt.close(fig)
+            buffer.seek(0)
+
+            print(
+                f"  🌳 Visualisasi pohon dibuat di memori "
+                f"(ukuran: {fig_width:.0f}x{fig_height:.0f} in @ {DPI} dpi "
+                f"= {fig_width*DPI:.0f}x{fig_height*DPI:.0f} px, "
+                f"{n_nodes} node, depth={depth})"
+            )
+            return buffer
+        except Exception as exc:
+            print(f"  ⚠️  Gagal generate tree image: {exc}")
+            return None
 
     def _build_report(
         self,
@@ -299,7 +317,9 @@ class DecisionTreeModel:
                 {"peringkat": i + 1, "nama": name, "nilai": imp}
                 for i, (name, imp) in enumerate(importances_sorted)
             ],
-            "tree_image_path": TREE_IMAGE_PATH if os.path.exists(TREE_IMAGE_PATH) else None,
+            # Gambar pohon tidak lagi disimpan sebagai file; frontend
+            # mengambilnya langsung lewat GET /model/tree-image.
+            "tree_image_path": None,
         }
 
     def latih(self, aturan: dict, data_latih: list[dict] | None = None) -> dict:
@@ -375,7 +395,11 @@ class DecisionTreeModel:
 
         self.report_ = self._build_report(y_test, y_pred, X, y, cv_scores, X_train, X_test)
 
-        self._generate_tree_image()
+        # Catatan: gambar pohon TIDAK dibuat di sini lagi. Ini sengaja —
+        # men-generate PNG saat training itu kerja sia-sia kalau tidak
+        # ada yang melihatnya, dan filesystem serverless (mis. Vercel)
+        # tidak persisten sehingga menyimpannya percuma. Gambar dibuat
+        # on-demand saat frontend memanggil GET /model/tree-image.
         self._save()
 
         return {
@@ -541,7 +565,8 @@ class DecisionTreeModel:
         if not self.report_:
             raise ValueError("Report belum tersedia. Latih ulang model.")
         report = dict(self.report_)
-        report["tree_image_path"] = TREE_IMAGE_PATH if os.path.exists(TREE_IMAGE_PATH) else None
+        # Gambar tidak disimpan sebagai file; ambil lewat GET /model/tree-image.
+        report["tree_image_path"] = None
         return report
 
     def get_tree_text(self) -> str:

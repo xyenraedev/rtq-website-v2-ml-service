@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-import os
+from dotenv import load_dotenv
+
+# Load .env untuk development lokal. Di Vercel ini no-op (tidak ada
+# file .env yang ikut ke-deploy) karena env var sudah disuntikkan
+# langsung oleh platform — harus dipanggil SEBELUM import model,
+# supaya SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY sudah ada di
+# os.environ saat model.py membuat Supabase client.
+load_dotenv()
 
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
-from model import DecisionTreeModel, TREE_IMAGE_PATH
+from model import DecisionTreeModel
 
 app = Flask(__name__)
 CORS(app)
@@ -112,7 +119,7 @@ def model_report():
     - Hasil 5-fold cross validation per fold (Tabel 4.8)
     - Confusion matrix TP/FN/FP/TN (Tabel 4.9)
     - Feature importance terurut (Tabel 4.10)
-    - Path gambar visualisasi pohon keputusan (Gambar 4.8)
+    - tree_image_path selalu null — ambil gambar lewat GET /model/tree-image (Gambar 4.8)
     """
     try:
         return jsonify(_model.get_report())
@@ -123,12 +130,24 @@ def model_report():
 @app.get("/model/tree-image")
 def tree_image():
     """
-    Mengembalikan file PNG visualisasi pohon keputusan (Gambar 4.8).
-    Gambar di-generate otomatis saat model selesai dilatih.
+    Mengembalikan file PNG visualisasi pohon keputusan (Gambar 4.8),
+    di-generate on-demand di memori (BytesIO) — TIDAK pernah ditulis
+    ke disk. Cocok untuk lingkungan serverless (mis. Vercel) yang
+    filesystem-nya read-only / tidak persisten.
     """
-    if not os.path.exists(TREE_IMAGE_PATH):
-        return jsonify({"error": "Visualisasi pohon belum tersedia. Latih model terlebih dahulu."}), 404
-    return send_file(TREE_IMAGE_PATH, mimetype="image/png")
+    if not _model.is_trained:
+        return jsonify({"error": "Model belum dilatih."}), 404
+
+    buffer = _model._generate_tree_image()
+    if buffer is None:
+        return jsonify({"error": "Gagal membuat visualisasi pohon."}), 500
+
+    return send_file(
+        buffer,
+        mimetype="image/png",
+        as_attachment=False,
+        download_name="tree_visualization.png",
+    )
 
 
 @app.get("/model/tree-text")
