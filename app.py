@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # file .env yang ikut ke-deploy) karena env var sudah disuntikkan
 # langsung oleh platform — harus dipanggil SEBELUM import model,
 # supaya SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY sudah ada di
-# os.environ saat model.py membuat Supabase client.
+# os.environ saat model.py membuat Supabase client
 load_dotenv()
 
 from flask import Flask, jsonify, request, send_file
